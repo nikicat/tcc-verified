@@ -4833,10 +4833,13 @@ dependencies = [
 name = "verifier"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bincode",
  "bytemuck",
  "methods",
  "risc0-zkvm",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

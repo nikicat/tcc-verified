@@ -59,6 +59,46 @@ cargo run --release -p verifier -- out/receipt.groth16.bin out/hello examples/he
 Iterate without proving: `cargo run -p host -- examples/hello.c --dev`
 (`RISC0_DEV_MODE`, fake receipt).
 
+## Verifiable provenance — how to actually use this
+
+A project ships provenance in three steps:
+
+```sh
+cloud/prove-remote.sh src/main.c                       # 1. prove the compilation (~cents)
+attest out/remote-main/receipt.groth16.bin \
+       --exe out/remote-main/hello --embed             # 2. package + embed the attestation
+git push && publish the binary                         # 3. source reachable from a public commit
+```
+
+A consumer verifies with **no toolchain, no rebuild, in milliseconds**:
+
+```sh
+verifier --exe ./hello --git-dir ./their-repo
+# proof              : VALID (5ms)
+# binary sha256      : 2466bd... == ./hello ✓
+# git linkage        : commit 94da263... -> examples/hello.c ✓
+```
+
+What this proves: *this exact executable was produced by the pinned
+compiler (image id in `CANONICAL_IMAGE_ID`) from a source file that lives
+at that path in that commit.* The attestation (`.prov.json`, or embedded
+in the executable as an ignored ELF trailer — the binary still runs)
+contains the claims in the clear plus the 665-byte Groth16 proof; every
+field is cross-checked against the proven journal, so nothing in the file
+can lie. The verifier's trust root is the compiler pin baked in at build
+time — URLs and descriptions inside attestations are unauthenticated
+hints, never trust inputs. Full format and trust model:
+[docs/provenance-design.md](docs/provenance-design.md).
+
+## Documentation
+
+- [docs/architecture.md](docs/architecture.md) — what/where/why/how for contributors
+- [docs/provenance-design.md](docs/provenance-design.md) — attestation format, trust model, embedding
+- [docs/measurements.md](docs/measurements.md) — all benchmark data + the cost model
+- [docs/compiler-economics.md](docs/compiler-economics.md) — TCC vs gcc/clang, extrapolations
+- [docs/operations.md](docs/operations.md) — cloud runbook, CI, sharp edges
+- [docs/roadmap.md](docs/roadmap.md) — future plans
+
 ## Measurements
 
 Compilation cost is linear in source size (~450 guest cycles/byte; TCC
