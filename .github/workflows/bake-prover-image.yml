@@ -24,6 +24,9 @@ permissions:
 jobs:
   bake:
     runs-on: ubuntu-latest
+    # a failed CUDA kernel compile makes cargo "fail slowly" (parallel nvcc
+    # jobs drain for an hour+); don't let doomed runs burn the 6h ceiling
+    timeout-minutes: 150
     steps:
       # the image is ~20 GB; the stock runner has too little free disk
       - name: Free disk space

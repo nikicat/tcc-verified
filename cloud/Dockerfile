@@ -24,9 +24,14 @@ RUN curl -L https://risczero.com/install | bash \
     && rzup install rust 1.94.1 \
     && rzup install cpp 2024.1.5
 
-# prebuild the project to bake compile caches into the image (~30 min once;
-# includes the CUDA kernel build). prove-remote.sh rsyncs fresh sources over
-# this and rebuilds incrementally in seconds.
+# CUDA arch must be explicit: risc0-build-kernel defaults to -arch=native,
+# which probes a GPU the CI runner doesn't have (and setting this var is the
+# upstream-intended way to disable that). sm_89 = RTX 4090; the embedded
+# compute_89 PTX lets newer GPUs (e.g. 5090) JIT. Older GPUs need a rebake.
+ENV NVCC_APPEND_FLAGS="-gencode arch=compute_89,code=[sm_89,compute_89]"
+
+# prebuild the project: the guest built here IS the canonical compiler
+# (CANONICAL_IMAGE_ID); instances run this binary as-is, no rebuild.
 COPY . /opt/tcc-verified
 WORKDIR /opt/tcc-verified
 RUN cargo build --release -p host --features cuda

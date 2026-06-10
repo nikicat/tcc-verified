@@ -28,5 +28,8 @@ rzup install rust 1.94.1 || true
 rzup install cpp 2024.1.5 || true
 
 cd /opt/tcc-verified
+# match the baked image's arch flags (see cloud/Dockerfile); on a live GPU
+# instance -arch=native would also work, but keep the builds identical
+export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:--gencode arch=compute_89,code=[sm_89,compute_89]}"
 cargo build --release -p host --features cuda
 RISC0_PROVER=local ./target/release/host --image-id
