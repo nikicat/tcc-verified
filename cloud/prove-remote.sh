@@ -19,6 +19,8 @@
 #   --gpu NAME        GPU model filter            (default: RTX_4090)
 #   --max-dph N       max $/hr                    (default: 0.60)
 #   --image IMG       docker image                (default: nvidia/cuda:12.6.3-devel-ubuntu24.04)
+#                     prebaked (boots ready, see .github/workflows/bake-prover-image.yml):
+#                     --image ghcr.io/nikicat/tcc-verified-prover:latest
 #   --instance ID     reuse an existing instance (skip search/create)
 #   --keep            don't destroy the instance afterwards
 #   --skip-wrap       stop after fetching the succinct receipt
