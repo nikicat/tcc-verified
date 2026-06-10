@@ -59,53 +59,70 @@ cargo run --release -p verifier -- out/receipt.groth16.bin out/hello examples/he
 Iterate without proving: `cargo run -p host -- examples/hello.c --dev`
 (`RISC0_DEV_MODE`, fake receipt).
 
-## Measured on this machine (8-core i9-era CPU, AVX-512, no GPU)
+## Measurements
 
-Guest execution: ~1.34 M user cycles (2 segments) to compile
-`examples/hello.c` (619 bytes) into a 1196-byte static ELF.
+Compilation cost is linear in source size (~450 guest cycles/byte; TCC
+startup ≈ 1.2 M cycles). Execution is ~25 MHz emulated — proving is the
+entire cost. Receipt sizes and verification are constant: 223 KB / ~18 ms
+(succinct), **665 B / ~5 ms (groth16)**, any program size.
 
-| receipt   | proof size | proving time | verification |
-|-----------|-----------:|-------------:|-------------:|
-| composite |     563 KB |       1101 s |        41 ms |
-| succinct  |     223 KB |       1258 s |        18 ms |
-| groth16   |  **665 B** |       1557 s |     **4 ms** |
+**Proving wall-time** (succinct; local CPU = 8-core AVX-512, GPU = rented
+RTX 4090 @ $0.39/hr via `cloud/prove-remote.sh`):
 
-(groth16 wraps the succinct pipeline plus a STARK→SNARK proving container —
-run via rootless podman here. Proof size and verification cost are constant
-in program size for succinct/groth16.)
+| source | size | segments | CPU | GPU | GPU cost |
+|---|---:|---:|---:|---:|---:|
+| hello.c | 619 B | 2 | 1258 s | **14.9 s** | <0.2¢ |
+| bench_small.c | 5.9 KB | 5 | — | **19.2 s** | ~0.2¢ |
+| bench_medium.c | 24.9 KB | 14 | — | **33.1 s** | ~0.4¢ |
+| bench_large.c | 103 KB | 50 | ~9 h (est.) | **89.6 s** | ~1¢ |
 
-Native `tcc examples/hello.c` compiles in ~1 ms; the ~10⁴–10⁵× proving
-overhead is paid once, while every verification afterwards is milliseconds.
+GPU scaling: ~12 s fixed + ~1.55 s/segment (1 segment = 2²⁰ cycles ≈ 2.3 KB
+of source). The groth16 wrap adds a constant ~160-230 s on the local CPU
+(`host --wrap`, podman) and can run anywhere.
+
+Local CPU groth16 end-to-end (hello.c): composite 1101 s / succinct 1258 s /
+groth16 1557 s — i.e. the GPU is ~85-350× faster and a verified compilation
+of 100 KB of C costs about a cent.
+
+Native `tcc` compiles these in ~1 ms; the proving overhead is paid once,
+while every verification afterwards is milliseconds, forever.
 
 ## Cloud GPU proving (vast.ai)
 
 Proving is separable from compilation: execution runs at ~25 MHz emulated
-(the 47 M-cycle benchmark executes in ~2 s) and segments serialize to
-~250 KB each, so the heavy part — segment STARKs — can run anywhere. Receipts
-are self-verifying, which makes the cheap spot GPU market safe: a bad host
-can fail to deliver, but never forge.
+and segments serialize to ~250 KB each, so the heavy part — segment STARKs —
+can run anywhere. Receipts are self-verifying, which makes the cheap spot
+GPU market safe: a bad host can fail to deliver, but never forge.
 
 ```sh
 pip install vastai && vastai set api-key <KEY>   # + ssh key in account, ~$10 balance
 cloud/prove-remote.sh examples/bench_large.c     # rent 4090 -> prove -> fetch -> wrap -> verify
 ```
 
-The driver rents the cheapest reliable RTX 4090 (~$0.35/hr), rsyncs the repo,
-builds with `--features cuda` (first boot ~35 min, then incremental), proves
-the **succinct** receipt on GPU, downloads it (223 KB), wraps to **groth16
-locally** through podman (`host --wrap`, avoids docker-in-docker on container
-rentals), verifies, and destroys the instance. IMAGE_ID is compared
-local-vs-remote before proving (pinned rzup toolchains make guest builds
-reproducible). `cloud/Dockerfile` bakes a prebuilt image for instant boots if
-you push it to a registry.
+**The canonical compiler is the CI-baked image** (`cloud/Dockerfile` →
+ghcr.io/nikicat/tcc-verified-prover, built by GitHub Actions): guest builds
+are only reproducible inside a fixed environment, so the image's guest IS
+the pinned compiler (`CANONICAL_IMAGE_ID`, enforced by CI on every bake —
+independently reproduced by two builders). Instances boot it prebuilt
+(~4 min image pull, zero remote building), prove the **succinct** receipt
+on GPU, and the driver wraps to **groth16 locally** through podman
+(`host --wrap`, avoids docker-in-docker on container rentals), verifies
+against the pin, and destroys the instance. Rebakes reuse the cargo-chef
+registry cache: ~15 min instead of ~60 (the CUDA kernel layer only rebuilds
+when dependencies change).
 
-Expected per-proof cost on a 4090: hello.c < 1¢, bench_large (~50 segments)
-~5¢ in ~10 min — vs ~9 h on an 8-core CPU.
+Measured end-to-end (cold instance to verified groth16): hello.c ≈ 8 min
+wall, of which 17 s is GPU proving and ~3 min the local wrap; marginal cost
+per proof ≈ 1¢ at bench_large size (see Measurements).
 
 ## Layout
 
-- `examples/hello.c` — freestanding hello world (raw `syscall`, no libc), so
-  the produced ELF depends on nothing outside the proof statement
+- `examples/` — freestanding programs (raw `syscall`, no libc — the pinned
+  statement is single-file `-nostdlib`, so the produced ELFs depend on
+  nothing outside the proof): `hello.c`; realistic kernels `fib.c`,
+  `primes.c` (sieve to 10⁶), `sort.c` (recursive quicksort + FNV
+  self-check) whose proven binaries compute verifiably correct results,
+  each ~12 s GPU proving; synthetic `bench_*.c` for size scaling
 - `vendor/tinycc` — pinned TCC sources (see `VENDORED_COMMIT`)
 - `methods/guest/` — zkVM guest: `build.rs` cross-compiles TCC
   (`ONE_SOURCE`, `TCC_TARGET_X86_64`, `CONFIG_TCC_PREDEFS`), `shim/sys.c` is
