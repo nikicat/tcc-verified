@@ -11,7 +11,7 @@ FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates build-essential cmake ninja-build \
-        pkg-config libssl-dev openssh-server rsync jq protobuf-compiler \
+        pkg-config libssl-dev openssh-server rsync jq protobuf-compiler clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # host Rust toolchain
