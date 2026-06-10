@@ -61,12 +61,21 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:buildcache,mode=max
 
       # the canonical compiler id, straight from the trusted build — compare
-      # against the repo's CANONICAL_IMAGE_ID (and update the pin on change)
+      # against the repo's CANONICAL_IMAGE_ID (and update the pin on change).
+      # host links libcuda (absent without a driver); a stub generated from
+      # the binary's own undefined cu* symbols satisfies the BIND_NOW linker,
+      # since --image-id never calls CUDA.
       - name: Report canonical IMAGE_ID
         run: |
-          ID=$(docker run --rm ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:${{ github.sha }} \
-              /opt/tcc-verified/target/release/host --image-id)
+          ID=$(docker run --rm --entrypoint bash \
+              ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:${{ github.sha }} -c '
+              nm -D --undefined-only /opt/tcc-verified/target/release/host \
+                | sed "s/@.*//" | awk "\$1==\"U\" && \$2 ~ /^cu/ {print \"void \" \$2 \"(void){}\"}" \
+                | sort -u > /tmp/stub.c
+              gcc -shared -o /tmp/libcuda.so.1 /tmp/stub.c
+              LD_LIBRARY_PATH=/tmp exec /opt/tcc-verified/target/release/host --image-id')
           echo "canonical IMAGE_ID: $ID" | tee -a "$GITHUB_STEP_SUMMARY"
-          if [ -f CANONICAL_IMAGE_ID ] && [ "$(cat CANONICAL_IMAGE_ID)" != "$ID" ]; then
-            echo "::warning::IMAGE_ID drifted from pinned CANONICAL_IMAGE_ID — update the pin"
+          if [ "$(cat CANONICAL_IMAGE_ID)" != "$ID" ]; then
+            echo "::error::IMAGE_ID $ID drifted from pinned CANONICAL_IMAGE_ID — update the pin"
+            exit 1
           fi
