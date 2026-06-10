@@ -40,6 +40,16 @@ WORKDIR /opt/tcc-verified
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
+# ---- guest-check: fail fast on the fragile part ----
+# The guest (canonical compiler: vendored TCC + shims + toolchain pins)
+# builds in ~10 min. Buildx runs this stage in parallel with the cook below
+# and cancels everything if it fails — without it, a guest breakage would
+# hide behind the hour-long kernel build (cargo never kills in-flight jobs).
+FROM base AS guest-check
+WORKDIR /opt/tcc-verified
+COPY . .
+RUN cargo build --release -p methods
+
 # ---- cook: build dependencies only (the expensive, cacheable layer) ----
 FROM base AS builder
 WORKDIR /opt/tcc-verified
@@ -48,4 +58,7 @@ RUN cargo chef cook --release -p host --features cuda --recipe-path recipe.json
 
 # ---- build: workspace crates + the canonical guest (fast) ----
 COPY . .
+# reuse the guest artifacts built by guest-check (also forces the stage
+# dependency that makes its failure abort this build)
+COPY --from=guest-check /opt/tcc-verified/target/riscv-guest /opt/tcc-verified/target/riscv-guest
 RUN cargo build --release -p host --features cuda
