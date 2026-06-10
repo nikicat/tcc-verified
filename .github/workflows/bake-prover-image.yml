@@ -59,3 +59,14 @@ jobs:
           # build), so source-only rebakes skip the expensive phase entirely
           cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:buildcache
           cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:buildcache,mode=max
+
+      # the canonical compiler id, straight from the trusted build — compare
+      # against the repo's CANONICAL_IMAGE_ID (and update the pin on change)
+      - name: Report canonical IMAGE_ID
+        run: |
+          ID=$(docker run --rm ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:${{ github.sha }} \
+              /opt/tcc-verified/target/release/host --image-id)
+          echo "canonical IMAGE_ID: $ID" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ -f CANONICAL_IMAGE_ID ] && [ "$(cat CANONICAL_IMAGE_ID)" != "$ID" ]; then
+            echo "::warning::IMAGE_ID drifted from pinned CANONICAL_IMAGE_ID — update the pin"
+          fi
