@@ -7,11 +7,11 @@
 # Run on the instance (prove-remote.sh does this automatically when needed).
 set -euxo pipefail
 
-if ! command -v cc >/dev/null; then
+if ! command -v cc >/dev/null || ! command -v protoc >/dev/null; then
     apt-get update
     apt-get install -y --no-install-recommends \
         curl git ca-certificates build-essential cmake ninja-build \
-        pkg-config libssl-dev rsync jq
+        pkg-config libssl-dev rsync jq protobuf-compiler
 fi
 
 if [ ! -x "$HOME/.cargo/bin/cargo" ]; then
