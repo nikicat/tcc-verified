@@ -59,15 +59,16 @@ CREATED=0
 if [ -z "$INSTANCE" ]; then
     log "searching offers: $GPU, <= \$$MAX_DPH/hr, reliable, fast net..."
     OFFER=$(vastai search offers \
-        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.98 cuda_vers>=12.4 inet_down>200 disk_space>40 dph<=$MAX_DPH" \
+        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.99 cuda_vers>=12.4 inet_down>200 disk_space>40 dph<=$MAX_DPH" \
         -o dph --raw | jq '.[0]')
     [ "$OFFER" != "null" ] || { echo "no offers matched"; exit 1; }
     OFFER_ID=$(jq -r '.id' <<<"$OFFER")
     log "cheapest offer: id=$OFFER_ID $(jq -r '"\(.gpu_name) @ $\(.dph_total)/hr, \(.inet_down)Mbps down, reliability \(.reliability2 // .reliability)"' <<<"$OFFER")"
 
     log "creating instance (image: $IMAGE)..."
-    INSTANCE=$(vastai create instance "$OFFER_ID" --image "$IMAGE" --disk 48 --ssh --direct --raw | jq -r '.new_contract')
-    [ -n "$INSTANCE" ] && [ "$INSTANCE" != "null" ] || { echo "create failed"; exit 1; }
+    CREATE_OUT=$(vastai create instance "$OFFER_ID" --image "$IMAGE" --disk 48 --ssh --direct --raw)
+    INSTANCE=$(jq -r '.new_contract' <<<"$CREATE_OUT" 2>/dev/null) || true
+    [ -n "$INSTANCE" ] && [ "$INSTANCE" != "null" ] || { echo "create failed, raw output:"; echo "$CREATE_OUT"; exit 1; }
     CREATED=1
     log "instance id: $INSTANCE"
 fi
@@ -86,11 +87,13 @@ trap destroy EXIT
 log "waiting for instance to start..."
 for i in $(seq 1 60); do
     INFO=$(vastai show instance "$INSTANCE" --raw)
-    STATUS=$(jq -r '.actual_status // empty' <<<"$INFO")
+    # API reports progress inconsistently: actual_status may stay null while
+    # cur_state says running; trust either, fall through to the ssh probe.
+    STATUS=$(jq -r '.actual_status // .cur_state // empty' <<<"$INFO")
     [ "$STATUS" = "running" ] && break
     sleep 10
 done
-[ "$STATUS" = "running" ] || { echo "instance never reached running state"; exit 1; }
+[ "$STATUS" = "running" ] || { echo "instance never reached running state: $(jq -c '{actual_status,cur_state,status_msg}' <<<"$INFO")"; exit 1; }
 SSH_HOST=$(jq -r '.ssh_host' <<<"$INFO")
 SSH_PORT=$(jq -r '.ssh_port' <<<"$INFO")
 SSH=(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$SSH_HOST")
