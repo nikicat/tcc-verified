@@ -44,7 +44,9 @@ fn main() {
     if let Some(receipt_path) = wrap {
         let receipt: Receipt =
             bincode::deserialize(&fs::read(&receipt_path).expect("read receipt")).expect("decode");
-        receipt.verify(COMPILE_GUEST_ID).expect("input receipt invalid");
+        // pure compression: no IMAGE_ID check here, so receipts proven by the
+        // canonical (docker-baked) guest wrap fine on a machine whose local
+        // guest build differs. The verifier does the final ID check.
         fs::create_dir_all(&out_dir).expect("create out dir");
         println!("wrapping {} to groth16...", receipt_path.display());
         let t0 = Instant::now();
@@ -52,7 +54,6 @@ fn main() {
             .compress(&ProverOpts::groth16(), &receipt)
             .unwrap();
         let dt = t0.elapsed();
-        groth16.verify(COMPILE_GUEST_ID).expect("wrapped receipt invalid");
         let bytes = bincode::serialize(&groth16).unwrap();
         let path = out_dir.join("receipt.groth16.bin");
         fs::write(&path, &bytes).unwrap();

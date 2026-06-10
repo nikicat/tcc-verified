@@ -17,10 +17,27 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+fn parse_image_id(hex_str: &str) -> [u32; 8] {
+    let s = hex_str.trim();
+    assert_eq!(s.len(), 64, "image id must be 64 hex chars");
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).expect("bad hex in image id");
+    }
+    bytemuck::cast(bytes)
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // --image-id <hex>: verify against a pinned canonical guest (e.g. the
+    // CI-baked image) instead of this machine's local guest build.
+    let mut image_id = COMPILE_GUEST_ID;
+    if let Some(i) = args.iter().position(|a| a == "--image-id") {
+        args.remove(i);
+        image_id = parse_image_id(&args.remove(i));
+    }
     let [receipt_path, binary_path, rest @ ..] = args.as_slice() else {
-        eprintln!("usage: verifier <receipt.bin> <binary> [source.c]");
+        eprintln!("usage: verifier <receipt.bin> <binary> [source.c] [--image-id <hex>]");
         std::process::exit(2);
     };
 
@@ -29,7 +46,7 @@ fn main() {
     let binary = fs::read(binary_path).expect("read binary");
 
     let t0 = Instant::now();
-    receipt.verify(COMPILE_GUEST_ID).expect("RECEIPT INVALID");
+    receipt.verify(image_id).expect("RECEIPT INVALID");
     let dt = t0.elapsed();
 
     let j = &receipt.journal.bytes;
@@ -40,7 +57,7 @@ fn main() {
     assert_eq!(h_bin.as_slice(), h_out, "BINARY DOES NOT MATCH PROOF");
 
     println!("receipt            : VALID (cryptographically verified in {dt:.2?})");
-    println!("pinned compiler    : image id {}", hex(bytemuck::cast_slice(&COMPILE_GUEST_ID)));
+    println!("pinned compiler    : image id {}", hex(bytemuck::cast_slice(&image_id)));
     println!("sha256(source)     : {}", hex(h_src));
     println!("git blob sha1      : {} (cf. `git hash-object <source>`)", hex(blob_sha1));
     println!("sha256(binary)     : {} == {binary_path} ✓", hex(h_out));

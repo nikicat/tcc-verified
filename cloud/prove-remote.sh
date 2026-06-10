@@ -3,9 +3,11 @@
 #
 #   cloud/prove-remote.sh <source.c> [options]
 #
-# Flow: rent cheapest matching GPU -> rsync repo -> remote: build (incremental)
-# + prove succinct on GPU -> fetch receipt (223 KB) + binary -> local: wrap to
-# groth16 via podman -> verify -> destroy instance.
+# Default flow uses the CI-baked image (ghcr): the instance boots with the
+# prover prebuilt, the source is shipped as a runtime input, and the receipt
+# comes back proven by the CANONICAL guest (id in CANONICAL_IMAGE_ID, baked
+# by .github/workflows/bake-prover-image.yml). No remote build: source files
+# are inputs and do not affect the IMAGE_ID.
 #
 # Receipts are self-verifying: a malicious/flaky host can only fail to
 # deliver, never forge - which is why the cheap spot market is safe here.
@@ -18,23 +20,22 @@
 # Options:
 #   --gpu NAME        GPU model filter            (default: RTX_4090)
 #   --max-dph N       max $/hr                    (default: 0.60)
-#   --image IMG       docker image                (default: nvidia/cuda:12.6.3-devel-ubuntu24.04)
-#                     prebaked (boots ready, see .github/workflows/bake-prover-image.yml):
-#                     --image ghcr.io/nikicat/tcc-verified-prover:latest
+#   --image IMG       docker image                (default: ghcr.io/nikicat/tcc-verified-prover:latest)
+#                     stock images (slow path, provisions + builds on boot):
+#                     --image nvidia/cuda:12.6.3-devel-ubuntu24.04
 #   --instance ID     reuse an existing instance (skip search/create)
 #   --keep            don't destroy the instance afterwards
 #   --skip-wrap       stop after fetching the succinct receipt
 #
 # NOTE: vastai CLI output formats drift between versions; the jq paths below
-# are for vastai 0.5.x. If search/create break, check `vastai search offers
-# --help` first.
+# are for vastai 0.5.x.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SRC=""
 GPU="RTX_4090"
 MAX_DPH="0.60"
-IMAGE="nvidia/cuda:12.6.3-devel-ubuntu24.04"
+IMAGE="ghcr.io/nikicat/tcc-verified-prover:latest"
 INSTANCE=""
 KEEP=0
 SKIP_WRAP=0
@@ -84,8 +85,9 @@ destroy() {
 trap destroy EXIT
 
 # ---------- 2. wait for ssh ----------
-log "waiting for instance to start..."
-for i in $(seq 1 60); do
+log "waiting for instance to start (baked image pull ~3-5 min)..."
+STATUS=""
+for i in $(seq 1 90); do
     INFO=$(vastai show instance "$INSTANCE" --raw)
     # API reports progress inconsistently: actual_status may stay null while
     # cur_state says running; trust either, fall through to the ssh probe.
@@ -98,31 +100,37 @@ SSH_HOST=$(jq -r '.ssh_host' <<<"$INFO")
 SSH_PORT=$(jq -r '.ssh_port' <<<"$INFO")
 SSH=(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$SSH_HOST")
 log "ssh: root@$SSH_HOST:$SSH_PORT"
-for i in $(seq 1 30); do "${SSH[@]}" true 2>/dev/null && break; sleep 5; done
+SSH_OK=0
+for i in $(seq 1 60); do "${SSH[@]}" true 2>/dev/null && { SSH_OK=1; break; }; sleep 5; done
+[ "$SSH_OK" = 1 ] || { echo "ssh never came up"; exit 1; }
 
-# ---------- 3. sync + provision + build ----------
-log "rsyncing project..."
-rsync -az --delete --exclude target --exclude out --exclude .git \
-    -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=accept-new" \
-    ./ "root@$SSH_HOST:/opt/tcc-verified/"
+# ---------- 3. prebaked or provision ----------
+if "${SSH[@]}" '[ -x /opt/tcc-verified/target/release/host ]' 2>/dev/null; then
+    log "prebaked image detected, no remote build needed"
+else
+    log "stock image: rsyncing project + provisioning (~35 min first boot)..."
+    rsync -az --delete --exclude target --exclude out --exclude .git \
+        -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=accept-new" \
+        ./ "root@$SSH_HOST:/opt/tcc-verified/"
+    "${SSH[@]}" "bash /opt/tcc-verified/cloud/provision.sh" | tail -1
+fi
 
-log "provisioning + building (first boot ~30-40 min, warm instance ~seconds)..."
-"${SSH[@]}" "bash /opt/tcc-verified/cloud/provision.sh" | tail -1 > /tmp/remote-image-id
-REMOTE_ID=$(cat /tmp/remote-image-id)
-LOCAL_ID=$(./target/release/host --image-id 2>/dev/null || true)
-if [ -n "$LOCAL_ID" ] && [ "$REMOTE_ID" != "$LOCAL_ID" ]; then
-    echo "FATAL: remote IMAGE_ID $REMOTE_ID != local $LOCAL_ID (toolchain drift?)"
+# canonical id: pinned in-repo by CI bake; fall back to local build's id
+EXPECTED_ID=$(cat CANONICAL_IMAGE_ID 2>/dev/null || ./target/release/host --image-id 2>/dev/null || true)
+REMOTE_ID=$("${SSH[@]}" 'cd /opt/tcc-verified && ./target/release/host --image-id')
+if [ -n "$EXPECTED_ID" ] && [ "$REMOTE_ID" != "$EXPECTED_ID" ]; then
+    echo "FATAL: remote IMAGE_ID $REMOTE_ID != expected $EXPECTED_ID"
+    echo "(is the instance running an outdated baked image?)"
     exit 1
 fi
-log "image id match: $REMOTE_ID"
+log "image id: $REMOTE_ID"
 
-# ---------- 4. prove on GPU ----------
-SRC_REL=$(realpath --relative-to=. "$SRC")
-case "$SRC_REL" in ../*) echo "source must live inside the repo (rsync ships the repo)"; exit 2 ;; esac
-log "proving $SRC_REL (succinct, GPU)..."
+# ---------- 4. ship source, prove on GPU ----------
+log "proving $SRC (succinct, GPU)..."
+scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$SRC" "root@$SSH_HOST:/tmp/input.c"
 T0=$(date +%s)
 "${SSH[@]}" "cd /opt/tcc-verified && RISC0_PROVER=local RUST_LOG=info \
-    ./target/release/host '$SRC_REL' --mode succinct --out-dir out" \
+    ./target/release/host /tmp/input.c --mode succinct --out-dir /tmp/out" \
     | tee /tmp/remote-prove.log
 T1=$(date +%s)
 log "remote GPU proving wall time: $((T1 - T0))s"
@@ -131,18 +139,20 @@ log "remote GPU proving wall time: $((T1 - T0))s"
 RDIR="out/remote-$(basename "$SRC" .c)"
 mkdir -p "$RDIR"
 scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
-    "root@$SSH_HOST:/opt/tcc-verified/out/receipt.succinct.bin" \
-    "root@$SSH_HOST:/opt/tcc-verified/out/hello" "$RDIR/"
+    "root@$SSH_HOST:/tmp/out/receipt.succinct.bin" \
+    "root@$SSH_HOST:/tmp/out/hello" "$RDIR/"
 log "fetched: $RDIR/receipt.succinct.bin ($(stat -c%s "$RDIR/receipt.succinct.bin") bytes) + binary"
 
-# ---------- 6. local groth16 wrap + verify ----------
+# ---------- 6. local groth16 wrap + verify against the canonical id ----------
+VERIFY_ARGS=()
+[ -n "$EXPECTED_ID" ] && VERIFY_ARGS=(--image-id "$EXPECTED_ID")
 if [ "$SKIP_WRAP" = 0 ]; then
     log "wrapping to groth16 locally (podman)..."
     DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/podman/podman.sock}" \
         RISC0_PROVER=local ./target/release/host --wrap "$RDIR/receipt.succinct.bin" --out-dir "$RDIR"
-    ./target/release/verifier "$RDIR/receipt.groth16.bin" "$RDIR/hello" "$SRC"
+    ./target/release/verifier "$RDIR/receipt.groth16.bin" "$RDIR/hello" "$SRC" "${VERIFY_ARGS[@]}"
 else
-    ./target/release/verifier "$RDIR/receipt.succinct.bin" "$RDIR/hello" "$SRC"
+    ./target/release/verifier "$RDIR/receipt.succinct.bin" "$RDIR/hello" "$SRC" "${VERIFY_ARGS[@]}"
 fi
 
 log "done. artifacts in $RDIR/"
