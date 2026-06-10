@@ -77,6 +77,31 @@ in program size for succinct/groth16.)
 Native `tcc examples/hello.c` compiles in ~1 ms; the ~10⁴–10⁵× proving
 overhead is paid once, while every verification afterwards is milliseconds.
 
+## Cloud GPU proving (vast.ai)
+
+Proving is separable from compilation: execution runs at ~25 MHz emulated
+(the 47 M-cycle benchmark executes in ~2 s) and segments serialize to
+~250 KB each, so the heavy part — segment STARKs — can run anywhere. Receipts
+are self-verifying, which makes the cheap spot GPU market safe: a bad host
+can fail to deliver, but never forge.
+
+```sh
+pip install vastai && vastai set api-key <KEY>   # + ssh key in account, ~$10 balance
+cloud/prove-remote.sh examples/bench_large.c     # rent 4090 -> prove -> fetch -> wrap -> verify
+```
+
+The driver rents the cheapest reliable RTX 4090 (~$0.35/hr), rsyncs the repo,
+builds with `--features cuda` (first boot ~35 min, then incremental), proves
+the **succinct** receipt on GPU, downloads it (223 KB), wraps to **groth16
+locally** through podman (`host --wrap`, avoids docker-in-docker on container
+rentals), verifies, and destroys the instance. IMAGE_ID is compared
+local-vs-remote before proving (pinned rzup toolchains make guest builds
+reproducible). `cloud/Dockerfile` bakes a prebuilt image for instant boots if
+you push it to a registry.
+
+Expected per-proof cost on a 4090: hello.c < 1¢, bench_large (~50 segments)
+~5¢ in ~10 min — vs ~9 h on an 8-core CPU.
+
 ## Layout
 
 - `examples/hello.c` — freestanding hello world (raw `syscall`, no libc), so

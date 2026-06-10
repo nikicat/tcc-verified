@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use methods::{COMPILE_GUEST_ELF, COMPILE_GUEST_ID};
-use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, ProverOpts};
+use risc0_zkvm::{default_prover, ExecutorEnv, InnerReceipt, ProverOpts, Receipt};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -24,13 +24,41 @@ fn main() {
     let mut source = None;
     let mut mode = "composite".to_string();
     let mut out_dir = PathBuf::from("out");
+    let mut wrap: Option<PathBuf> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--mode" => mode = args.next().expect("--mode needs a value"),
             "--dev" => std::env::set_var("RISC0_DEV_MODE", "1"),
             "--out-dir" => out_dir = args.next().expect("--out-dir needs a value").into(),
+            "--wrap" => wrap = Some(args.next().expect("--wrap needs a receipt path").into()),
+            "--image-id" => {
+                println!("{}", hex(bytemuck::cast_slice(&COMPILE_GUEST_ID)));
+                return;
+            }
             _ => source = Some(PathBuf::from(a)),
         }
+    }
+
+    // --wrap: compress an existing (e.g. remotely-proven succinct) receipt to
+    // groth16 locally. Needs a docker-compatible CLI (podman: set DOCKER_HOST).
+    if let Some(receipt_path) = wrap {
+        let receipt: Receipt =
+            bincode::deserialize(&fs::read(&receipt_path).expect("read receipt")).expect("decode");
+        receipt.verify(COMPILE_GUEST_ID).expect("input receipt invalid");
+        fs::create_dir_all(&out_dir).expect("create out dir");
+        println!("wrapping {} to groth16...", receipt_path.display());
+        let t0 = Instant::now();
+        let groth16 = default_prover()
+            .compress(&ProverOpts::groth16(), &receipt)
+            .unwrap();
+        let dt = t0.elapsed();
+        groth16.verify(COMPILE_GUEST_ID).expect("wrapped receipt invalid");
+        let bytes = bincode::serialize(&groth16).unwrap();
+        let path = out_dir.join("receipt.groth16.bin");
+        fs::write(&path, &bytes).unwrap();
+        println!("receipt            : {} ({} bytes, groth16)", path.display(), bytes.len());
+        println!("wrap time          : {dt:.2?}");
+        return;
     }
     let source = source.expect("usage: host <source.c> [--mode composite|succinct|groth16] [--dev] [--out-dir DIR]");
     let src = fs::read(&source).expect("read source");
