@@ -1,25 +1,27 @@
 # Prebaked vast.ai image: CUDA prover for tcc-verified, ready at boot.
+# Built by .github/workflows/bake-prover-image.yml; the guest compiled in
+# here IS the canonical compiler (CANONICAL_IMAGE_ID pins it).
 #
-# Build & push (only needed if you want fast instance boots; the no-registry
-# alternative is cloud/provision.sh on a stock image):
-#   docker build -f cloud/Dockerfile -t <you>/tcc-verified-prover:latest .
-#   docker push <you>/tcc-verified-prover:latest
+# cargo-chef layer split: dependency compilation (including the ~40-80 min
+# CUDA kernel builds in risc0-circuit-*-sys) lives in the `cook` layer keyed
+# only on Cargo.toml/Cargo.lock, and is reused from the registry build cache
+# across bakes. Source-only changes rebuild in minutes.
 #
 # The base must be a -devel image: risc0's CUDA kernels compile with nvcc.
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+FROM nvidia/cuda:12.6.3-devel-ubuntu24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl git ca-certificates build-essential cmake ninja-build \
-        pkg-config libssl-dev openssh-server rsync jq protobuf-compiler clang libclang-dev \
+        pkg-config libssl-dev openssh-server rsync jq protobuf-compiler \
+        clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # host Rust toolchain
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH=/root/.cargo/bin:/root/.risc0/bin:$PATH
 
-# RISC Zero toolchains, pinned to the same versions as the local machine so
-# the guest build is bit-identical => same IMAGE_ID => receipts verify locally
+# RISC Zero toolchains, pinned: the canonical guest build environment
 RUN curl -L https://risczero.com/install | bash \
     && rzup install rust 1.94.1 \
     && rzup install cpp 2024.1.5
@@ -30,8 +32,20 @@ RUN curl -L https://risczero.com/install | bash \
 # compute_89 PTX lets newer GPUs (e.g. 5090) JIT. Older GPUs need a rebake.
 ENV NVCC_APPEND_FLAGS="-gencode arch=compute_89,code=[sm_89,compute_89]"
 
-# prebuild the project: the guest built here IS the canonical compiler
-# (CANONICAL_IMAGE_ID); instances run this binary as-is, no rebuild.
-COPY . /opt/tcc-verified
+RUN cargo install cargo-chef --locked
+
+# ---- plan: distill the dependency graph into a recipe ----
+FROM base AS planner
 WORKDIR /opt/tcc-verified
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- cook: build dependencies only (the expensive, cacheable layer) ----
+FROM base AS builder
+WORKDIR /opt/tcc-verified
+COPY --from=planner /opt/tcc-verified/recipe.json recipe.json
+RUN cargo chef cook --release -p host --features cuda --recipe-path recipe.json
+
+# ---- build: workspace crates + the canonical guest (fast) ----
+COPY . .
 RUN cargo build --release -p host --features cuda

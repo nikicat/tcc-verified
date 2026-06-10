@@ -44,6 +44,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # container driver is required for registry-backed layer caching
+      - uses: docker/setup-buildx-action@v3
+
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -52,3 +55,7 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:latest
             ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:${{ github.sha }}
+          # mode=max also exports the cargo-chef cook layer (the CUDA kernel
+          # build), so source-only rebakes skip the expensive phase entirely
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/tcc-verified-prover:buildcache,mode=max
