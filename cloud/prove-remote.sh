@@ -125,9 +125,11 @@ for i in $(seq 1 90); do
 done
 [ "$STATUS" = "running" ] || { echo "instance never reached running state: $(jq -c '{actual_status,cur_state,status_msg}' <<<"$INFO")"; exit 1; }
 # ssh_host/ssh_port can stay null in the API well after status=running —
-# re-poll until assigned, then probe (capturing them once loses the race)
+# re-poll until assigned, then probe (capturing them once loses the race).
+# Patience: weak-disk hosts can take 15+ min to pull/extract a ~17 GB
+# image; status_msg distinguishes slow ("Pulling 67%...") from dead.
 SSH_OK=0
-for i in $(seq 1 140); do
+for i in $(seq 1 280); do
     INFO=$(vastai show instance "$INSTANCE" --raw)
     SSH_HOST=$(jq -r '.ssh_host // empty' <<<"$INFO")
     SSH_PORT=$(jq -r '.ssh_port // empty' <<<"$INFO")
@@ -135,10 +137,10 @@ for i in $(seq 1 140); do
         SSH=(ssh -p "$SSH_PORT" "${SSH_BASE[@]}" "root@$SSH_HOST")
         "${SSH[@]}" true 2>/dev/null && { SSH_OK=1; break; }
     fi
-    [ $((i % 12)) = 0 ] && log "still waiting for ssh (port: ${SSH_PORT:-unassigned}, likely image pull)..."
+    [ $((i % 12)) = 0 ] && log "still waiting for ssh (port: ${SSH_PORT:-unassigned}, status: $(jq -r '.status_msg // "-"' <<<"$INFO" | tr '\n' ' ' | head -c 110))"
     sleep 5
 done
-[ "$SSH_OK" = 1 ] || { echo "ssh never came up (port assigned: ${SSH_PORT:-no})"; exit 1; }
+[ "$SSH_OK" = 1 ] || { echo "ssh never came up (port assigned: ${SSH_PORT:-no}, last status: $(jq -r '.status_msg // "-"' <<<"$INFO"))"; exit 1; }
 log "ssh: root@$SSH_HOST:$SSH_PORT"
 
 # sanity: some hosts rent out containers without a working CUDA device
