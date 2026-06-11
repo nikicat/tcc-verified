@@ -17,7 +17,14 @@
 #   ssh key attached to the account (web UI: Account > SSH Keys)
 #   systemctl --user start podman.socket   (for the local groth16 wrap)
 #
+# Multi-TU builds (see docs/architecture.md): pass a build manifest instead
+# of a source file; the manifest's directory is rsynced to the instance and
+# every receipt of the chain is wrapped locally afterwards.
+#
+#   cloud/prove-remote.sh --build examples/musl-hello/build.json
+#
 # Options:
+#   --build FILE      build.json manifest instead of a single source
 #   --gpu NAME        GPU model filter            (default: RTX_4090)
 #   --max-dph N       max $/hr                    (default: 0.60)
 #   --image IMG       docker image                (default: ghcr.io/nikicat/tcc-verified-prover:latest)
@@ -25,7 +32,7 @@
 #                     --image nvidia/cuda:12.6.3-devel-ubuntu24.04
 #   --instance ID     reuse an existing instance (skip search/create)
 #   --keep            don't destroy the instance afterwards
-#   --skip-wrap       stop after fetching the succinct receipt
+#   --skip-wrap       stop after fetching the succinct receipt(s)
 #
 # NOTE: vastai CLI output formats drift between versions; the jq paths below
 # are for vastai 0.5.x.
@@ -33,6 +40,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SRC=""
+BUILD=""
 GPU="RTX_4090"
 MAX_DPH="0.60"
 IMAGE="ghcr.io/nikicat/tcc-verified-prover:latest"
@@ -41,6 +49,7 @@ KEEP=0
 SKIP_WRAP=0
 while [ $# -gt 0 ]; do
     case "$1" in
+        --build) BUILD="$2"; shift 2 ;;
         --gpu) GPU="$2"; shift 2 ;;
         --max-dph) MAX_DPH="$2"; shift 2 ;;
         --image) IMAGE="$2"; shift 2 ;;
@@ -50,8 +59,9 @@ while [ $# -gt 0 ]; do
         *) SRC="$1"; shift ;;
     esac
 done
-[ -n "$SRC" ] || { echo "usage: $0 <source.c> [--gpu RTX_4090] [--max-dph 0.60] [--keep]"; exit 2; }
-[ -f "$SRC" ] || { echo "no such source: $SRC"; exit 2; }
+[ -n "$SRC" ] || [ -n "$BUILD" ] || { echo "usage: $0 <source.c> | --build <build.json> [--gpu RTX_4090] [--max-dph 0.60] [--keep]"; exit 2; }
+[ -z "$SRC" ] || [ -f "$SRC" ] || { echo "no such source: $SRC"; exit 2; }
+[ -z "$BUILD" ] || [ -f "$BUILD" ] || { echo "no such build manifest: $BUILD"; exit 2; }
 
 # progress reporting: every stage line goes, timestamped and unbuffered, to
 # $PROGRESS_FILE — `tail -f` it from anywhere regardless of stdout buffering
@@ -155,7 +165,52 @@ if [ -n "$EXPECTED_ID" ] && [ "$REMOTE_ID" != "$EXPECTED_ID" ]; then
 fi
 log "image id: $REMOTE_ID"
 
-# ---------- 4. ship source, prove on GPU ----------
+# ---------- 4. ship inputs, prove on GPU ----------
+VERIFY_ARGS=()
+[ -n "$EXPECTED_ID" ] && VERIFY_ARGS=(--image-id "$EXPECTED_ID")
+PODMAN_DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/podman/podman.sock}"
+
+if [ -n "$BUILD" ]; then
+    # multi-TU build: ship the manifest's directory (e.g. the pinned musl
+    # checkout), run the batched jobs + link remotely, fetch the chain
+    BDIR=$(dirname "$BUILD")
+    BNAME=$(basename "$BUILD")
+    RDIR="out/remote-$(basename "$BDIR")"
+    log "rsyncing build tree $BDIR (excluding scratch build/)..."
+    rsync -az --delete --exclude build \
+        -e "ssh -p $SSH_PORT ${SSH_BASE[*]}" \
+        "$BDIR/" "root@$SSH_HOST:/tmp/buildtree/"
+    log "proving build $BUILD (succinct, GPU)..."
+    T0=$(date +%s)
+    "${SSH[@]}" "cd /opt/tcc-verified && RISC0_PROVER=local RUST_LOG=info \
+        ./target/release/host --build /tmp/buildtree/$BNAME --mode succinct --out-dir /tmp/out" \
+        2>&1 | tee -a "$PROGRESS_FILE"
+    T1=$(date +%s)
+    log "remote GPU proving wall time: $((T1 - T0))s"
+
+    OUTPUT=$(jq -r '.output' "$BUILD")
+    mkdir -p "$RDIR"
+    scp -P "$SSH_PORT" "${SSH_BASE[@]}" \
+        "root@$SSH_HOST:/tmp/out/receipt.*.bin" \
+        "root@$SSH_HOST:/tmp/out/chain.json" \
+        "root@$SSH_HOST:/tmp/out/$OUTPUT" "$RDIR/"
+    log "fetched: $(ls "$RDIR" | wc -l) files (receipt chain + $OUTPUT)"
+
+    if [ "$SKIP_WRAP" = 0 ]; then
+        log "wrapping every receipt of the chain to groth16 locally (podman)..."
+        for r in "$RDIR"/receipt.*.succinct.bin; do
+            DOCKER_HOST="$PODMAN_DOCKER_HOST" RISC0_PROVER=local \
+                ./target/release/host --wrap "$r" --out-dir "$RDIR"
+            rm "$r"
+        done
+        jq '.receipts |= map(sub("\\.succinct\\.bin$"; ".groth16.bin"))' \
+            "$RDIR/chain.json" >"$RDIR/chain.json.tmp" && mv "$RDIR/chain.json.tmp" "$RDIR/chain.json"
+    fi
+    ./target/release/verifier --chain "$RDIR/chain.json" "${VERIFY_ARGS[@]}"
+    log "done. artifacts in $RDIR/"
+    exit 0
+fi
+
 log "proving $SRC (succinct, GPU)..."
 scp -P "$SSH_PORT" "${SSH_BASE[@]}" "$SRC" "root@$SSH_HOST:/tmp/input.c"
 T0=$(date +%s)
@@ -174,11 +229,9 @@ scp -P "$SSH_PORT" "${SSH_BASE[@]}" \
 log "fetched: $RDIR/receipt.succinct.bin ($(stat -c%s "$RDIR/receipt.succinct.bin") bytes) + binary"
 
 # ---------- 6. local groth16 wrap + verify against the canonical id ----------
-VERIFY_ARGS=()
-[ -n "$EXPECTED_ID" ] && VERIFY_ARGS=(--image-id "$EXPECTED_ID")
 if [ "$SKIP_WRAP" = 0 ]; then
     log "wrapping to groth16 locally (podman)..."
-    DOCKER_HOST="${DOCKER_HOST:-unix:///run/user/$(id -u)/podman/podman.sock}" \
+    DOCKER_HOST="$PODMAN_DOCKER_HOST" \
         RISC0_PROVER=local ./target/release/host --wrap "$RDIR/receipt.succinct.bin" --out-dir "$RDIR"
     ./target/release/verifier "$RDIR/receipt.groth16.bin" "$RDIR/hello" "$SRC" "${VERIFY_ARGS[@]}"
 else

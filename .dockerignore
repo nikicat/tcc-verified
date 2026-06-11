@@ -1,0 +1,7 @@
+# Keep the bake context equal to a clean checkout (CI) — local scratch
+# state must not leak into the canonical image (or slow the context upload).
+target/
+out/
+.git/
+examples/musl-hello/musl/
+examples/musl-hello/build/
