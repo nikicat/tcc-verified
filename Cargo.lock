@@ -1836,9 +1836,12 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "bytemuck",
+ "jobfmt",
  "methods",
  "risc0-zkvm",
  "serde",
+ "serde_json",
+ "sha2",
  "tracing-subscriber 0.3.23",
 ]
 
@@ -2197,6 +2200,13 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jobfmt"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "jobserver"
@@ -4836,6 +4846,7 @@ dependencies = [
  "base64",
  "bincode",
  "bytemuck",
+ "jobfmt",
  "methods",
  "risc0-zkvm",
  "serde",
