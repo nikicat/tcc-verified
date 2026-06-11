@@ -6,11 +6,14 @@ vast.ai RTX 4090 @ ~$0.39/hr via `cloud/prove-remote.sh`.
 ## Cost model (validated, use for planning)
 
 ```
-guest cycles ≈ 1.2M (TCC startup) + ~450 × source bytes    (±10% by code density)
-1 segment    = 2^20 cycles ≈ 2.3 KB of source
+guest cycles ≈ 1.2M (job startup) + ~450 × bytes *parsed per TU*
+               (single self-contained file: ≈ source bytes, ±10% by density;
+                multi-TU: each TU re-parses its include closure — for musl
+                TUs that's ~100–300 KB of headers ⇒ ~7–9M cycles per TU)
+1 segment    = 2^20 cycles ≈ 2.3 KB of self-contained source
 GPU(4090)    ≈ 12 s fixed + ~1.55 s/segment  ⇒  ~12 min and ~$0.08 per MB of source
 CPU(8-core)  ≈ ~550 s/segment (composite)    ⇒  ~85–350× slower than one 4090
-groth16 wrap : constant ~160–230 s (CPU + podman rapidsnark container)
+groth16 wrap : constant ~160–230 s per receipt (CPU + podman rapidsnark)
 verification : constant — 665 B receipt, ~5 ms, any program size
 execution    : ~25 MHz emulated (compilation output available in seconds)
 ```
@@ -48,6 +51,39 @@ Outputs computed by the *proven* binaries, checked correct:
 Realistic code structure (loops, recursion, arrays) barely differs from
 synthetic code per byte — source size drives cost, not code shape.
 
+## Multi-TU: musl hello (examples/musl-hello, measured 2026-06-11)
+
+44 TUs (hello.c + crt1 + 42 musl/tcc-runtime TUs from the printf closure),
+115 input files, batch 16 ⇒ 3 compile jobs + 1 link job, 41 374-byte
+static executable that prints `hello, musl 42`. Byte-identical output
+across separate `--only` runs, dev and GPU executions (deterministic).
+
+| job | TUs | user cycles | segments |
+|---|---:|---:|---:|
+| job000 | 16 | 142.5 M | 176 |
+| job001 | 16 | 114.3 M | 141 |
+| job002 | 12 | 65.8 M | 81 |
+| link | 1 op | 1.8 M | 3 |
+| total | 44 | 324.4 M | 401 |
+
+**Measured on a rented 4090** ($0.40/hr, `prove-remote.sh --build`): the
+whole chain proved succinct in **740 s wall** (the 12 s + 1.55 s/segment
+model predicts 634 s of pure proving — the rest is per-job executor +
+serialization overhead). The four local groth16 wraps took 160–177 s
+each; end-to-end cold instance → verified groth16 chain ≈ 29 min wall.
+Exact billed cost (`vastai show invoices`): **$0.174** for the instance
+(GPU $0.167 + storage $0.007 — storage bills the requested 48 GB for the
+full lifetime, including the ~5 min image pull/boot). Parallelizing the
+3 compile jobs across instances (`--only`) would cut GPU wall to the
+largest job (~285 s) at the price of paying boot overhead per instance.
+
+Per-TU cost is dominated by the include closure (~7–9 M cycles ≈ 8–10
+segments per musl TU), not TU body size — batching amortizes only the
+1.2 M-cycle job startup. The link job is nearly free (3 segments).
+Journals are no longer 84 bytes: each commits its full manifest, so the
+groth16 receipts are journal-dominated (8.6–18.5 KB instead of 665 B);
+the 4-receipt embedded attestation is ~99 KB and verifies in ~17 ms.
+
 ## Other measured facts
 
 - Segments serialize to ~250 KB each (≈12.7 MB for the 50-segment program)
@@ -66,10 +102,15 @@ synthetic code per byte — source size drives cost, not code shape.
 
 | target | source | est. GPU time | est. cost | blocker |
 |---|---:|---:|---:|---|
-| DOOM (~38K LOC) | ~1.5 MB | ~20 min | ~12¢ | needs musl headers in guest (memfs) |
-| musl libc (~380 TUs) | ~5 MB | ~65 min serial | ~45¢ | multi-TU orchestration + proven link step |
+| DOOM (~38K LOC, ~60 TUs) | ~1.5 MB | ~1–1.5 h serial | ~25–55¢ | build manifest + enough musl closure for its I/O (multi-file inputs: done) |
+| musl libc, all ~1262 TUs | ~5 MB | ~3.5 h serial | ~$1.40 | 37 TUs fail TCC (x87 asm constraints `x`/`t`, expl.s syntax) |
 | sqlite amalgamation | 8.4 MB | ~105 min | ~70¢ | TCC heap for one giant TU vs rv32 address space |
 | gcc | 50+ MB | (~10 h if it compiled) | ~$4 | TCC can't compile C++; memory needs 64-bit guest |
+
+(Multi-TU estimates use the measured per-TU include-closure cost, not raw
+source size — that is why "all of musl" got *more* expensive than the old
+naive ~45¢ extrapolation while parallelizing better: every job is
+independent, so wall time divides by the number of GPUs.)
 
 Cycles/byte is a property of the *compiler*, not of proving: gcc/clang -O0
 ≈ 10× TCC's slope, -O2 ≈ 30–100× (see `docs/compiler-economics.md`).
