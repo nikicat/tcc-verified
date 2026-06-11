@@ -190,14 +190,21 @@ if [ -n "$BUILD" ]; then
     BDIR=$(dirname "$BUILD")
     BNAME=$(basename "$BUILD")
     RDIR="out/remote-$(basename "$BDIR")"
-    log "rsyncing build tree $BDIR (excluding scratch build/)..."
+    # manifests may reference repo files outside their dir (../../vendor/...),
+    # so a repo-relative build tree lands at the same path inside the
+    # instance's repo copy; absolute/outside trees fall back to /tmp
+    case "$BDIR" in
+        /*) REMOTE_BDIR="/tmp/buildtree" ;;
+        *) REMOTE_BDIR="/opt/tcc-verified/$BDIR" ;;
+    esac
+    log "rsyncing build tree $BDIR -> $REMOTE_BDIR (excluding scratch build/)..."
     rsync -az --delete --exclude build --exclude .git \
         -e "ssh -p $SSH_PORT ${SSH_BASE[*]}" \
-        "$BDIR/" "root@$SSH_HOST:/tmp/buildtree/"
+        "$BDIR/" "root@$SSH_HOST:$REMOTE_BDIR/"
     log "proving build $BUILD (succinct, GPU)..."
     T0=$(date +%s)
     "${SSH[@]}" "cd /opt/tcc-verified && RISC0_PROVER=local RUST_LOG=info \
-        ./target/release/host --build /tmp/buildtree/$BNAME --mode succinct --out-dir /tmp/out" \
+        ./target/release/host --build $REMOTE_BDIR/$BNAME --mode succinct --out-dir /tmp/out" \
         2>&1 | tee -a "$PROGRESS_FILE"
     T1=$(date +%s)
     log "remote GPU proving wall time: $((T1 - T0))s"
