@@ -1,3 +1,6 @@
 .DS_Store
 target/
 /out
+# musl-hello workspace: pinned upstream checkout + scratch build artifacts
+examples/musl-hello/musl/
+examples/musl-hello/build/

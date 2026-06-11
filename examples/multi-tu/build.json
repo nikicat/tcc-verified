@@ -1,0 +1,6 @@
+{
+  "files": [{ "path": "src/greet.h" }],
+  "tus": [{ "src": "src/main.c" }, { "src": "src/greet.c" }],
+  "batch_size": 1,
+  "output": "hello2"
+}
