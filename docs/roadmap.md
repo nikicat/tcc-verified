@@ -26,12 +26,39 @@ git-linked to musl.git by content). New IMAGE_ID — needs a re-pin bake.
   verifies with three command-line arguments (see provenance-design.md
   "how a project ships").
 
+- **Prebuilt musl in the image**: prove musl once with the multi-TU chain,
+  then bake the resulting headers + `libc.a` (+ `crt1.o`) into the guest —
+  they join the IMAGE_ID pin (a "compiler+libc release"), and per-program
+  cost drops to the user's TUs + link (headers still ship as inputs and
+  set the cost floor: a printf hello ≈ 2–3 segments). Static linking
+  against the baked archive keeps today's self-contained binaries;
+  dynamic (`libc.so` + baked `-dynamic-linker /lib/ld-musl-x86_64.so.1`)
+  also works in TCC and shrinks binaries, at the price of a runtime
+  dependency on an unproven-at-runtime `libc.so`. Trust note: this moves
+  libc inside the pinned TCB — mitigated by publishing the baked libc's
+  own receipt chain (proven bootstrap, see long-term) and the
+  reproducible image build.
+
 ## Medium-term
 
-- **Manifest compression**: journals now carry the full input file list
-  (~10–35 KB per musl-hello job, headers repeated per batch). Commit a
-  merkle root instead — most naturally the **git tree hash**, which also
-  upgrades linkage to "this commit's whole tree". New IMAGE_ID.
+- **Attestation to a git commit** ("this exe was built from signed commit
+  C by builder B"): add a *tree-attestation receipt* — one dedicated job
+  per build that reads the input tree and commits its **git tree hash**
+  (in-guest SHA-1 over blobs+trees costs ~20 cycles/byte *once per
+  build*, not per batch — the reason per-file linkage went content-based)
+  plus the per-file sha256 manifest. Compile jobs keep binding per-file
+  sha256; `verify_chain` additionally requires compile inputs ⊆ tree
+  receipt's file set. Upgrades the statement from "exe ← these listed
+  files" to "exe ← exactly commit C's tree": a signed commit (the
+  signature covers the commit object, which contains the tree hash) then
+  yields "built from what the signer signed". Pairs with **signed
+  builders**: the verifier accepts a trusted party's signature over the
+  32-byte guest IMAGE_ID instead of (or alongside) the compiled-in pin —
+  the compiler-id registry below, with signatures. Caveat: generated
+  files (musl's alltypes.h/syscall.h) break tree equality — commit them,
+  prove the generation step, or list them as explicit audited exceptions
+  in the attestation. Also subsumes **manifest compression** (journals
+  shrink to the tree hash + output hashes). New IMAGE_ID.
 - **Incremental proving**: receipts are content-addressed by the manifest;
   cache compile receipts keyed on (input hashes, ops) and only re-prove
   changed batches + the link.

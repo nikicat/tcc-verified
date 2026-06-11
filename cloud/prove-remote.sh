@@ -145,23 +145,37 @@ log "ssh: root@$SSH_HOST:$SSH_PORT"
 "${SSH[@]}" 'nvidia-smi -L' >/dev/null 2>&1 || { echo "FATAL: no CUDA device visible on the rented host — destroy and re-rent"; exit 1; }
 
 # ---------- 3. prebaked or provision ----------
-if "${SSH[@]}" '[ -x /opt/tcc-verified/target/release/host ]' 2>/dev/null; then
-    log "prebaked image detected, no remote build needed"
-else
-    log "stock image: rsyncing project + provisioning (~35 min first boot)..."
+sync_and_build() {
     rsync -az --delete --exclude target --exclude out --exclude .git \
+        --exclude examples/musl-hello/musl --exclude examples/musl-hello/build \
         -e "ssh -p $SSH_PORT ${SSH_BASE[*]}" \
         ./ "root@$SSH_HOST:/opt/tcc-verified/"
     "${SSH[@]}" "bash /opt/tcc-verified/cloud/provision.sh" | tail -1
+}
+
+if "${SSH[@]}" '[ -x /opt/tcc-verified/target/release/host ]' 2>/dev/null; then
+    log "prebaked image detected"
+else
+    log "stock image: rsyncing project + provisioning (~35 min first boot)..."
+    sync_and_build
 fi
 
 # canonical id: pinned in-repo by CI bake; fall back to local build's id
 EXPECTED_ID=$(cat CANONICAL_IMAGE_ID 2>/dev/null || ./target/release/host --image-id 2>/dev/null || true)
-REMOTE_ID=$("${SSH[@]}" 'cd /opt/tcc-verified && ./target/release/host --image-id')
+remote_id() { "${SSH[@]}" 'cd /opt/tcc-verified && ./target/release/host --image-id'; }
+REMOTE_ID=$(remote_id)
 if [ -n "$EXPECTED_ID" ] && [ "$REMOTE_ID" != "$EXPECTED_ID" ]; then
-    echo "FATAL: remote IMAGE_ID $REMOTE_ID != expected $EXPECTED_ID"
-    echo "(is the instance running an outdated baked image?)"
-    exit 1
+    # stale baked image (e.g. guest changed, CI hasn't rebaked): rebuild
+    # incrementally against the image's warm cargo target (~10-15 min) —
+    # provision.sh skips the toolchain steps when they're already present
+    log "remote guest $REMOTE_ID != expected $EXPECTED_ID; rebuilding from local sources..."
+    sync_and_build
+    REMOTE_ID=$(remote_id)
+    if [ "$REMOTE_ID" != "$EXPECTED_ID" ]; then
+        echo "FATAL: remote IMAGE_ID $REMOTE_ID != expected $EXPECTED_ID even after rebuild"
+        echo "(local sources out of sync with the pin? guest not reproducible on the image?)"
+        exit 1
+    fi
 fi
 log "image id: $REMOTE_ID"
 
@@ -177,7 +191,7 @@ if [ -n "$BUILD" ]; then
     BNAME=$(basename "$BUILD")
     RDIR="out/remote-$(basename "$BDIR")"
     log "rsyncing build tree $BDIR (excluding scratch build/)..."
-    rsync -az --delete --exclude build \
+    rsync -az --delete --exclude build --exclude .git \
         -e "ssh -p $SSH_PORT ${SSH_BASE[*]}" \
         "$BDIR/" "root@$SSH_HOST:/tmp/buildtree/"
     log "proving build $BUILD (succinct, GPU)..."
