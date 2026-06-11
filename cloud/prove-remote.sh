@@ -53,14 +53,31 @@ done
 [ -n "$SRC" ] || { echo "usage: $0 <source.c> [--gpu RTX_4090] [--max-dph 0.60] [--keep]"; exit 2; }
 [ -f "$SRC" ] || { echo "no such source: $SRC"; exit 2; }
 
-log() { printf '\033[1;34m[prove-remote]\033[0m %s\n' "$*"; }
+# progress reporting: every stage line goes, timestamped and unbuffered, to
+# $PROGRESS_FILE — `tail -f` it from anywhere regardless of stdout buffering
+T_START=$(date +%s)
+PROGRESS_FILE="${PROGRESS_FILE:-/tmp/prove-remote-progress.log}"
+: > "$PROGRESS_FILE"
+log() {
+    local msg="[prove-remote +$(($(date +%s) - T_START))s] $*"
+    printf '\033[1;34m%s\033[0m\n' "$msg"
+    printf '%s\n' "$msg" >> "$PROGRESS_FILE"
+}
+log "progress log: $PROGRESS_FILE"
+
+# deterministic single-key auth: agents with many (wrong) keys trip hosts'
+# MaxAuthTries ("Too many authentication failures"), and one auth attempt
+# also exposes hosts where vast's key injection failed, immediately
+SSH_KEY="${VAST_SSH_KEY:-$HOME/.ssh/id_ed25519}"
+SSH_BASE=(-F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -i "$SSH_KEY"
+          -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
 
 # ---------- 1. instance ----------
 CREATED=0
 if [ -z "$INSTANCE" ]; then
     log "searching offers: $GPU, <= \$$MAX_DPH/hr, reliable, fast net..."
     OFFER=$(vastai search offers \
-        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.99 cuda_vers>=12.4 inet_down>200 disk_space>40 dph<=$MAX_DPH" \
+        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.99 cuda_vers>=12.6 inet_down>200 disk_space>40 dph<=$MAX_DPH" \
         -o dph --raw | jq '.[0]')
     [ "$OFFER" != "null" ] || { echo "no offers matched"; exit 1; }
     OFFER_ID=$(jq -r '.id' <<<"$OFFER")
@@ -93,16 +110,29 @@ for i in $(seq 1 90); do
     # cur_state says running; trust either, fall through to the ssh probe.
     STATUS=$(jq -r '.actual_status // .cur_state // empty' <<<"$INFO")
     [ "$STATUS" = "running" ] && break
+    [ $((i % 6)) = 0 ] && log "still waiting for instance (status: ${STATUS:-none})..."
     sleep 10
 done
 [ "$STATUS" = "running" ] || { echo "instance never reached running state: $(jq -c '{actual_status,cur_state,status_msg}' <<<"$INFO")"; exit 1; }
-SSH_HOST=$(jq -r '.ssh_host' <<<"$INFO")
-SSH_PORT=$(jq -r '.ssh_port' <<<"$INFO")
-SSH=(ssh -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "root@$SSH_HOST")
-log "ssh: root@$SSH_HOST:$SSH_PORT"
+# ssh_host/ssh_port can stay null in the API well after status=running —
+# re-poll until assigned, then probe (capturing them once loses the race)
 SSH_OK=0
-for i in $(seq 1 60); do "${SSH[@]}" true 2>/dev/null && { SSH_OK=1; break; }; sleep 5; done
-[ "$SSH_OK" = 1 ] || { echo "ssh never came up"; exit 1; }
+for i in $(seq 1 140); do
+    INFO=$(vastai show instance "$INSTANCE" --raw)
+    SSH_HOST=$(jq -r '.ssh_host // empty' <<<"$INFO")
+    SSH_PORT=$(jq -r '.ssh_port // empty' <<<"$INFO")
+    if [ -n "$SSH_HOST" ] && [ -n "$SSH_PORT" ] && [ "$SSH_PORT" != "null" ]; then
+        SSH=(ssh -p "$SSH_PORT" "${SSH_BASE[@]}" "root@$SSH_HOST")
+        "${SSH[@]}" true 2>/dev/null && { SSH_OK=1; break; }
+    fi
+    [ $((i % 12)) = 0 ] && log "still waiting for ssh (port: ${SSH_PORT:-unassigned}, likely image pull)..."
+    sleep 5
+done
+[ "$SSH_OK" = 1 ] || { echo "ssh never came up (port assigned: ${SSH_PORT:-no})"; exit 1; }
+log "ssh: root@$SSH_HOST:$SSH_PORT"
+
+# sanity: some hosts rent out containers without a working CUDA device
+"${SSH[@]}" 'nvidia-smi -L' >/dev/null 2>&1 || { echo "FATAL: no CUDA device visible on the rented host — destroy and re-rent"; exit 1; }
 
 # ---------- 3. prebaked or provision ----------
 if "${SSH[@]}" '[ -x /opt/tcc-verified/target/release/host ]' 2>/dev/null; then
@@ -110,7 +140,7 @@ if "${SSH[@]}" '[ -x /opt/tcc-verified/target/release/host ]' 2>/dev/null; then
 else
     log "stock image: rsyncing project + provisioning (~35 min first boot)..."
     rsync -az --delete --exclude target --exclude out --exclude .git \
-        -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=accept-new" \
+        -e "ssh -p $SSH_PORT ${SSH_BASE[*]}" \
         ./ "root@$SSH_HOST:/opt/tcc-verified/"
     "${SSH[@]}" "bash /opt/tcc-verified/cloud/provision.sh" | tail -1
 fi
@@ -127,18 +157,18 @@ log "image id: $REMOTE_ID"
 
 # ---------- 4. ship source, prove on GPU ----------
 log "proving $SRC (succinct, GPU)..."
-scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new "$SRC" "root@$SSH_HOST:/tmp/input.c"
+scp -P "$SSH_PORT" "${SSH_BASE[@]}" "$SRC" "root@$SSH_HOST:/tmp/input.c"
 T0=$(date +%s)
 "${SSH[@]}" "cd /opt/tcc-verified && RISC0_PROVER=local RUST_LOG=info \
     ./target/release/host /tmp/input.c --mode succinct --out-dir /tmp/out" \
-    | tee /tmp/remote-prove.log
+    2>&1 | tee -a "$PROGRESS_FILE"
 T1=$(date +%s)
 log "remote GPU proving wall time: $((T1 - T0))s"
 
 # ---------- 5. fetch ----------
 RDIR="out/remote-$(basename "$SRC" .c)"
 mkdir -p "$RDIR"
-scp -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new \
+scp -P "$SSH_PORT" "${SSH_BASE[@]}" \
     "root@$SSH_HOST:/tmp/out/receipt.succinct.bin" \
     "root@$SSH_HOST:/tmp/out/hello" "$RDIR/"
 log "fetched: $RDIR/receipt.succinct.bin ($(stat -c%s "$RDIR/receipt.succinct.bin") bytes) + binary"
