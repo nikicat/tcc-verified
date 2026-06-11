@@ -39,6 +39,27 @@ Push to main touching `cloud/Dockerfile`, `Cargo.lock`,
   **fails on drift from `CANONICAL_IMAGE_ID`**. On an intentional compiler
   change: update the pin in the same PR.
 
+## Multi-TU builds
+
+- `prove-remote.sh --build examples/musl-hello/build.json` rsyncs the
+  manifest's directory (pinned musl checkout included) to the instance,
+  runs the batched jobs + link there, fetches the receipt chain, wraps
+  *every* receipt to groth16 locally, and verifies `--chain`. NOTE: written
+  against the new multi-TU host but **not yet exercised on a rental** — it
+  needs the rebaked image (the pre-2026-06-11 baked image has the
+  single-file guest and an old host binary).
+- Fan-out across instances: `host --build m.json --only N` on each box
+  (receipts + objects land in the shared out dir), then `--only link`
+  collects whatever `receipt.job*.bin` it finds. The objects move between
+  boxes as plain files; the chain check catches any mixup by hash.
+- Guest memfs limits (static, in `shim/sys.c`): 4096 files, 128 open fds,
+  200-char normalized paths, 32 MB output arena, 64 MB C heap. A full-musl
+  build (~1262 TUs in one job) would hit none of them per-batch, but keep
+  batches ≤ a few hundred TUs so journals stay small.
+- musl TUs that TCC cannot compile (37 of 1262, all x87 asm: `x`/`t`
+  register constraints, `expl.s` syntax): irrelevant for musl-hello's
+  closure, blocks "all of musl" — see roadmap.
+
 ## Sharp edges encountered (so you don't re-cut yourself)
 
 1. **CUDA arch**: risc0-build-kernel passes `-arch=native` unless
@@ -66,3 +87,12 @@ Push to main touching `cloud/Dockerfile`, `Cargo.lock`,
 7. **Default risc0 features**: `prove` is NOT in default features;
    without it `default_prover()` delegates to the external r0vm server.
    Host enables it explicitly; `RISC0_PROVER=local` forces in-process.
+8. **risc0 serde costs a word per byte** on `Vec<u8>` — never `env::read`
+   bulk data. Jobs cross host→guest as one length-prefixed `write_slice`
+   of packed u32 words (`env::read_frame` would do exactly this but is
+   feature-gated unstable in 3.0.5).
+9. **The 2026-06-11 guest change (multi-TU, journal v2) moved IMAGE_ID**:
+   the pin in `CANONICAL_IMAGE_ID` must be updated from the next CI bake
+   (or a local `docker build --target guest-check` + id extraction) before
+   the bake workflow goes green again. Old receipts keep verifying against
+   the old pin; keep it listed for historical attestations.

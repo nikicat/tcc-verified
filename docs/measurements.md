@@ -6,11 +6,14 @@ vast.ai RTX 4090 @ ~$0.39/hr via `cloud/prove-remote.sh`.
 ## Cost model (validated, use for planning)
 
 ```
-guest cycles ≈ 1.2M (TCC startup) + ~450 × source bytes    (±10% by code density)
-1 segment    = 2^20 cycles ≈ 2.3 KB of source
+guest cycles ≈ 1.2M (job startup) + ~450 × bytes *parsed per TU*
+               (single self-contained file: ≈ source bytes, ±10% by density;
+                multi-TU: each TU re-parses its include closure — for musl
+                TUs that's ~100–300 KB of headers ⇒ ~7–9M cycles per TU)
+1 segment    = 2^20 cycles ≈ 2.3 KB of self-contained source
 GPU(4090)    ≈ 12 s fixed + ~1.55 s/segment  ⇒  ~12 min and ~$0.08 per MB of source
 CPU(8-core)  ≈ ~550 s/segment (composite)    ⇒  ~85–350× slower than one 4090
-groth16 wrap : constant ~160–230 s (CPU + podman rapidsnark container)
+groth16 wrap : constant ~160–230 s per receipt (CPU + podman rapidsnark)
 verification : constant — 665 B receipt, ~5 ms, any program size
 execution    : ~25 MHz emulated (compilation output available in seconds)
 ```
@@ -48,6 +51,27 @@ Outputs computed by the *proven* binaries, checked correct:
 Realistic code structure (loops, recursion, arrays) barely differs from
 synthetic code per byte — source size drives cost, not code shape.
 
+## Multi-TU: musl hello (examples/musl-hello, measured 2026-06-11, dev-mode executor)
+
+44 TUs (hello.c + crt1 + 42 musl/tcc-runtime TUs from the printf closure),
+115 input files, batch 16 ⇒ 3 compile jobs + 1 link job, 41 374-byte
+static executable that prints `hello, musl 42`. Byte-identical output
+across separate `--only` runs (deterministic).
+
+| job | TUs | user cycles | segments | est. GPU (model) |
+|---|---:|---:|---:|---:|
+| job000 | 16 | 142.5 M | 176 | ~285 s |
+| job001 | 16 | 114.3 M | 141 | ~231 s |
+| job002 | 12 | 65.8 M | 81 | ~138 s |
+| link | 1 op | 1.8 M | 3 | ~17 s |
+| total | 44 | 324.4 M | 401 | ~634 s serial ≈ **7¢**, ~285 s across 4 GPUs |
+
+Per-TU cost is dominated by the include closure (~7–9 M cycles ≈ 8–10
+segments per musl TU), not TU body size — batching amortizes only the
+1.2 M-cycle job startup. The link job is nearly free (3 segments).
+Journals are no longer 84 bytes: each commits its full manifest
+(~10–35 KB/job here); the 4-receipt attestation for musl-hello is ~98 KB.
+
 ## Other measured facts
 
 - Segments serialize to ~250 KB each (≈12.7 MB for the 50-segment program)
@@ -66,10 +90,15 @@ synthetic code per byte — source size drives cost, not code shape.
 
 | target | source | est. GPU time | est. cost | blocker |
 |---|---:|---:|---:|---|
-| DOOM (~38K LOC) | ~1.5 MB | ~20 min | ~12¢ | needs musl headers in guest (memfs) |
-| musl libc (~380 TUs) | ~5 MB | ~65 min serial | ~45¢ | multi-TU orchestration + proven link step |
+| DOOM (~38K LOC, ~60 TUs) | ~1.5 MB | ~1–1.5 h serial | ~25–55¢ | build manifest + enough musl closure for its I/O (multi-file inputs: done) |
+| musl libc, all ~1262 TUs | ~5 MB | ~3.5 h serial | ~$1.40 | 37 TUs fail TCC (x87 asm constraints `x`/`t`, expl.s syntax) |
 | sqlite amalgamation | 8.4 MB | ~105 min | ~70¢ | TCC heap for one giant TU vs rv32 address space |
 | gcc | 50+ MB | (~10 h if it compiled) | ~$4 | TCC can't compile C++; memory needs 64-bit guest |
+
+(Multi-TU estimates use the measured per-TU include-closure cost, not raw
+source size — that is why "all of musl" got *more* expensive than the old
+naive ~45¢ extrapolation while parallelizing better: every job is
+independent, so wall time divides by the number of GPUs.)
 
 Cycles/byte is a property of the *compiler*, not of proving: gcc/clang -O0
 ≈ 10× TCC's slope, -O2 ≈ 30–100× (see `docs/compiler-economics.md`).

@@ -1,33 +1,40 @@
 # tcc-verified — cryptographic proof of compilation
 
 A proof-of-concept that produces a **succinct cryptographic proof that a binary
-is the result of compiling a given C source file** — verifiable in
+is the result of compiling given C sources** — verifiable in
 milliseconds, by anyone, without a compiler, toolchain, or re-execution.
+It scales from a single freestanding file to a real multi-TU program
+linked against musl libc (`examples/musl-hello`).
 
 [TinyCC](https://repo.or.cz/tinycc.git) is cross-compiled to riscv32im and runs
-*inside* the [RISC Zero](https://github.com/risc0/risc0) zkVM. The guest
-compiles the source entirely in memory into a statically-linked x86-64 Linux
-ELF and commits to the journal:
+*inside* the [RISC Zero](https://github.com/risc0/risc0) zkVM. The guest runs
+a *job* — compile translation units to object files, and/or link objects into
+a statically-linked x86-64 Linux ELF — entirely in an in-memory filesystem,
+and commits a manifest to the journal:
 
 ```
-sha256(source) || git-blob-sha1(source) || sha256(binary)      (84 bytes)
+ops (compile/link commands) || inputs [(path, sha256)..] || outputs [(path, sha256)..]
 ```
 
-The git blob hash (`git hash-object source.c`) links the proof to a git commit
-through the ordinary commit → tree → blob hash chain, which is publicly
-checkable outside the proof.
+Receipts chain by hash equality: the link job's input object hashes must be
+compile-job output hashes, so N parallel compile receipts + 1 link receipt
+prove an entire build. Source files are linked to git commits at
+*verification* time by content (resolve the path in a repo, compare the
+blob's sha256) — same binding as proving a git hash, but free.
 
 ## The proof statement
 
-> There exists an execution of the compiler image `IMAGE_ID` that read a source
-> file with hash `sha256(source)` (= git blob `B`) and produced output with
-> hash `sha256(binary)`.
+> There exists an execution of the compiler image `IMAGE_ID` that, given
+> exactly this input file tree (by sha256), ran these compile/link commands
+> and produced these outputs (by sha256).
 
 `IMAGE_ID` pins **everything**: the TCC binary (vendored at commit
 `vendor/tinycc/VENDORED_COMMIT`, built with the flags in
-`methods/guest/build.rs`), the compiler options (`-static -nostdlib`, baked
-into `methods/guest/shim/compile.c`), the newlib syscall shims, and the Rust
-guest wrapper. Trusting a receipt means trusting (a) the RISC Zero proof
+`methods/guest/build.rs`), the compiler options (`-nostdlib` per TU,
+`-static -nostdlib` for linking, baked into `methods/guest/shim/compile.c`),
+the newlib syscall shims, and the Rust guest wrapper. Include paths and
+`-D` defines are job inputs, but they are committed to the journal, so the
+verifier sees them. Trusting a receipt means trusting (a) the RISC Zero proof
 system, and (b) that this pinned compiler is an honest compiler — the proof
 removes trust in the *builder*, not in the compiler (Thompson's
 trusting-trust reduction still applies; you can audit the vendored sources).
@@ -59,35 +66,56 @@ cargo run --release -p verifier -- out/receipt.groth16.bin out/hello examples/he
 Iterate without proving: `cargo run -p host -- examples/hello.c --dev`
 (`RISC0_DEV_MODE`, fake receipt).
 
+## Multi-TU builds: hello world against real musl
+
+A build manifest (`build.json`) describes a file tree, translation units and
+the final link. The host batches TUs into compile jobs (one receipt each,
+embarrassingly parallel — `--only N` fans jobs out across machines), then
+proves the link; `chain.json` ties the receipts together:
+
+```sh
+examples/musl-hello/prepare.sh     # pin musl v1.2.5, headers, TU closure (native tcc)
+cargo run --release -p host -- --build examples/musl-hello/build.json --mode succinct
+./out/hello                        # => hello, musl 42
+cargo run --release -p verifier -- --chain out/chain.json \
+    --git-dir . --git-dir examples/musl-hello/musl
+```
+
+That's 44 proven TUs (vfprintf and the stdio internals, memcpy/memset
+x86-64 asm, TLS init, crt1, plus TCC's own runtime helpers from the vendor
+tree) + a proven link = a real `printf` hello world, every byte of which
+traces to pinned musl/tcc-verified git commits.
+
 ## Verifiable provenance — how to actually use this
 
 A project ships provenance in three steps:
 
 ```sh
-cloud/prove-remote.sh src/main.c                       # 1. prove the compilation (~cents)
+cloud/prove-remote.sh src/main.c                       # 1. prove (~cents; or --build m.json)
 attest out/remote-main/receipt.groth16.bin \
        --exe out/remote-main/hello --embed             # 2. package + embed the attestation
-git push && publish the binary                         # 3. source reachable from a public commit
+git push && publish the binary                         # 3. sources reachable from public commits
 ```
 
 A consumer verifies with **no toolchain, no rebuild, in milliseconds**:
 
 ```sh
 verifier --exe ./hello --git-dir ./their-repo
-# proof              : VALID (5ms)
+# proofs             : 1 receipts VALID (5ms)
 # binary sha256      : 2466bd... == ./hello ✓
-# git linkage        : commit 94da263... -> examples/hello.c ✓
+# git linkage        : src/main.c -> ./their-repo@94da263 src/main.c ✓
 ```
 
 What this proves: *this exact executable was produced by the pinned
-compiler (image id in `CANONICAL_IMAGE_ID`) from a source file that lives
-at that path in that commit.* The attestation (`.prov.json`, or embedded
-in the executable as an ignored ELF trailer — the binary still runs)
-contains the claims in the clear plus the 665-byte Groth16 proof; every
-field is cross-checked against the proven journal, so nothing in the file
-can lie. The verifier's trust root is the compiler pin baked in at build
-time — URLs and descriptions inside attestations are unauthenticated
-hints, never trust inputs. Full format and trust model:
+compiler (image id in `CANONICAL_IMAGE_ID`) from source files whose
+contents live at those paths in those commits.* The attestation
+(`.prov.json`, or embedded in the executable as an ignored ELF trailer —
+the binary still runs) contains the claims in the clear plus the 665-byte
+Groth16 proof per receipt; every field is cross-checked against the proven
+journals and the receipt chain, so nothing in the file can lie. The
+verifier's trust root is the compiler pin baked in at build time — URLs
+and descriptions inside attestations are unauthenticated hints, never
+trust inputs. Full format and trust model:
 [docs/provenance-design.md](docs/provenance-design.md).
 
 ## Documentation
@@ -101,10 +129,13 @@ hints, never trust inputs. Full format and trust model:
 
 ## Measurements
 
-Compilation cost is linear in source size (~450 guest cycles/byte; TCC
-startup ≈ 1.2 M cycles). Execution is ~25 MHz emulated — proving is the
+Compilation cost is linear in the bytes each TU parses (~450 guest
+cycles/byte; job startup ≈ 1.2 M cycles; for multi-TU builds the per-TU
+include closure dominates). Execution is ~25 MHz emulated — proving is the
 entire cost. Receipt sizes and verification are constant: 223 KB / ~18 ms
-(succinct), **665 B / ~5 ms (groth16)**, any program size.
+(succinct), **665 B / ~5 ms (groth16)**, per receipt, any program size.
+The musl hello chain is ~400 segments ⇒ ~10 min on one 4090 (~7¢), ~5 min
+across 4 (see [docs/measurements.md](docs/measurements.md)).
 
 **Proving wall-time** (succinct; local CPU = 8-core AVX-512, GPU = rented
 RTX 4090 @ $0.39/hr via `cloud/prove-remote.sh`):
@@ -157,20 +188,25 @@ per proof ≈ 1¢ at bench_large size (see Measurements).
 
 ## Layout
 
-- `examples/` — freestanding programs (raw `syscall`, no libc — the pinned
-  statement is single-file `-nostdlib`, so the produced ELFs depend on
-  nothing outside the proof): `hello.c`; realistic kernels `fib.c`,
-  `primes.c` (sieve to 10⁶), `sort.c` (recursive quicksort + FNV
-  self-check) whose proven binaries compute verifiably correct results,
-  each ~12 s GPU proving; synthetic `bench_*.c` for size scaling
-- `vendor/tinycc` — pinned TCC sources (see `VENDORED_COMMIT`)
+- `examples/` — freestanding single-file programs (raw `syscall`, no libc):
+  `hello.c`; realistic kernels `fib.c`, `primes.c` (sieve to 10⁶), `sort.c`
+  (recursive quicksort + FNV self-check) whose proven binaries compute
+  verifiably correct results, each ~12 s GPU proving; synthetic `bench_*.c`
+  for size scaling; `multi-tu/` — minimal 2-TU chain; `musl-hello/` —
+  `printf` hello against pinned musl v1.2.5 (44 proven TUs; `prepare.sh`
+  computes the closure with a native build of the vendored tcc)
+- `vendor/tinycc` — pinned TCC sources (see `VENDORED_COMMIT`);
+  `lib/libtcc1.c`/`lib/va_list.c` double as provable runtime-helper TUs
+- `jobfmt/` — shared job/journal/chain format (host ↔ guest ↔ verifier)
 - `methods/guest/` — zkVM guest: `build.rs` cross-compiles TCC
   (`ONE_SOURCE`, `TCC_TARGET_X86_64`, `CONFIG_TCC_PREDEFS`), `shim/sys.c` is
-  the newlib OS layer (bump-`sbrk`, in-memory output file, no real syscalls),
-  `shim/compile.c` drives libtcc, `src/main.rs` hashes + commits the journal
-- `host/` — proves a compilation, writes `out/hello` + `out/receipt.*.bin`
-- `verifier/` — standalone verification: `receipt.verify(IMAGE_ID)` + hash
-  comparison
+  the newlib OS layer (bump-`sbrk`, in-memory filesystem, no real syscalls),
+  `shim/compile.c` drives libtcc (compile-to-object and link ops),
+  `src/main.rs` runs the job, hashes + commits the manifest
+- `host/` — proves builds: single file or `--build build.json`
+  (batched compile jobs + link job + `chain.json`; `--only` for fan-out)
+- `verifier/` — standalone verification: every `receipt.verify(IMAGE_ID)`,
+  the hash chain, binary hash, content-based git linkage
 
 ## Prior art
 
