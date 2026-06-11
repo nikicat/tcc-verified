@@ -84,7 +84,11 @@ cargo run --release -p verifier -- --chain out/chain.json \
 That's 44 proven TUs (vfprintf and the stdio internals, memcpy/memset
 x86-64 asm, TLS init, crt1, plus TCC's own runtime helpers from the vendor
 tree) + a proven link = a real `printf` hello world, every byte of which
-traces to pinned musl/tcc-verified git commits.
+traces to pinned musl/tcc-verified git commits. Measured on a rented
+4090: the whole chain proves in **740 s** ($0.174 billed for the cold
+instance, end to end), wraps to four groth16 receipts locally, and the
+attestation embeds in the binary — which still runs and verifies in
+~17 ms.
 
 ## Verifiable provenance — how to actually use this
 
@@ -134,8 +138,9 @@ cycles/byte; job startup ≈ 1.2 M cycles; for multi-TU builds the per-TU
 include closure dominates). Execution is ~25 MHz emulated — proving is the
 entire cost. Receipt sizes and verification are constant: 223 KB / ~18 ms
 (succinct), **665 B / ~5 ms (groth16)**, per receipt, any program size.
-The musl hello chain is ~400 segments ⇒ ~10 min on one 4090 (~7¢), ~5 min
-across 4 (see [docs/measurements.md](docs/measurements.md)).
+The musl hello chain is 401 segments ⇒ measured 740 s on one 4090,
+$0.174 billed end-to-end; ~5 min across 4 GPUs
+(see [docs/measurements.md](docs/measurements.md)).
 
 **Proving wall-time** (succinct; local CPU = 8-core AVX-512, GPU = rented
 RTX 4090 @ $0.39/hr via `cloud/prove-remote.sh`):

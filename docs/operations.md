@@ -15,9 +15,26 @@ cloud/prove-remote.sh foo.c --instance <ID> --keep   # reuse a warm box
   <ID>`. **Check `vastai show instances` after any aborted session.**
 - Economics: 4090 ≈ $0.30–0.45/hr; GPU proving ≈ 12 s + 1.55 s/segment;
   parking a box costs ~$9/day — destroy, recreate in ~4 min.
+- **Exact spend**: `vastai show invoices --only_charges -s <date>` gives
+  per-instance GPU and storage line items — trust it over mental
+  arithmetic. Storage bills for the requested `--disk` for the whole
+  instance lifetime (including boot/pull), and failed-but-waiting
+  instances bill GPU time too: the 2026-06-11 live-debug session cost
+  ~$0.60 total, of which ~$0.43 was four failed/aborted rentals and
+  $0.174 the successful musl-hello run. Some hosts also bill bandwidth
+  per GB (`inet_down_cost`, $/GB, up to ~100× across hosts) — the offer
+  query caps it at $5/TB so image pulls stay ~free.
 - Reliability floor is 0.99 in the offer query for a reason: a 0.983 host
   took the rental and never started (no logs, no ssh). Failed hosts cost
   cents — destroy and re-rent.
+- **Probe every advertised ssh endpoint.** Three rentals in a row ran the
+  container fine while the advertised proxy `ssh_host:ssh_port` never
+  answered; the direct `public_ipaddr` + 22/tcp mapping worked
+  immediately. `ssh_wait` now tries the CLI's `ssh-url`, the proxy pair,
+  and the direct mapping each round. Also: after pulling the image, vast
+  builds a derived overlay (its ssh/tooling injection shows up as
+  buildkit `#N` steps in `status_msg`) — boot takes minutes longer than
+  the pull itself, which `status_msg` logging makes visible.
 - vastai CLI (0.5.x) quirks: some endpoints return non-JSON errors
   (`create failed, raw output:` handling exists); `actual_status` can stay
   null while `cur_state=running`; `show user` is broken in 0.5.0.
@@ -42,12 +59,12 @@ Push to main touching `cloud/Dockerfile`, `Cargo.lock`,
 ## Multi-TU builds
 
 - `prove-remote.sh --build examples/musl-hello/build.json` rsyncs the
-  manifest's directory (pinned musl checkout included) to the instance,
-  runs the batched jobs + link there, fetches the receipt chain, wraps
-  *every* receipt to groth16 locally, and verifies `--chain`. NOTE: written
-  against the new multi-TU host but **not yet exercised on a rental** — it
-  needs the rebaked image (the pre-2026-06-11 baked image has the
-  single-file guest and an old host binary).
+  manifest's directory (pinned musl checkout included) to the instance —
+  at its repo-relative path, so `../../vendor/...` references resolve
+  against the image's repo copy — runs the batched jobs + link there,
+  fetches the receipt chain, wraps *every* receipt to groth16 locally,
+  and verifies `--chain`. Measured 2026-06-11 (see measurements.md):
+  740 s GPU wall for the 401-segment chain, ~29 min end-to-end, ~12¢.
 - Fan-out across instances: `host --build m.json --only N` on each box
   (receipts + objects land in the shared out dir), then `--only link`
   collects whatever `receipt.job*.bin` it finds. The objects move between

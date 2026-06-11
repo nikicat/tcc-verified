@@ -146,8 +146,10 @@ CREATED=0
 instance_create() {
     log "searching offers: $GPU, <= \$$MAX_DPH/hr, reliable, fast net..."
     local offer offer_id create_out
+    # inet_down_cost is $/GB: cap at $5/TB so pulling the ~17 GB image
+    # can't add more than ~9 cents (some hosts charge 100x that)
     offer=$(vastai search offers \
-        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.99 cuda_vers>=12.6 inet_down>200 disk_space>40 dph<=$MAX_DPH" \
+        "gpu_name=$GPU num_gpus=1 rentable=true reliability>0.99 cuda_vers>=12.6 inet_down>200 inet_down_cost<=0.005 disk_space>40 dph<=$MAX_DPH" \
         -o dph --raw | jq '.[0]')
     [ "$offer" != "null" ] || { echo "no offers matched"; exit 1; }
     offer_id=$(jq -r '.id' <<<"$offer")

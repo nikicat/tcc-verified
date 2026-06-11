@@ -51,26 +51,38 @@ Outputs computed by the *proven* binaries, checked correct:
 Realistic code structure (loops, recursion, arrays) barely differs from
 synthetic code per byte — source size drives cost, not code shape.
 
-## Multi-TU: musl hello (examples/musl-hello, measured 2026-06-11, dev-mode executor)
+## Multi-TU: musl hello (examples/musl-hello, measured 2026-06-11)
 
 44 TUs (hello.c + crt1 + 42 musl/tcc-runtime TUs from the printf closure),
 115 input files, batch 16 ⇒ 3 compile jobs + 1 link job, 41 374-byte
 static executable that prints `hello, musl 42`. Byte-identical output
-across separate `--only` runs (deterministic).
+across separate `--only` runs, dev and GPU executions (deterministic).
 
-| job | TUs | user cycles | segments | est. GPU (model) |
-|---|---:|---:|---:|---:|
-| job000 | 16 | 142.5 M | 176 | ~285 s |
-| job001 | 16 | 114.3 M | 141 | ~231 s |
-| job002 | 12 | 65.8 M | 81 | ~138 s |
-| link | 1 op | 1.8 M | 3 | ~17 s |
-| total | 44 | 324.4 M | 401 | ~634 s serial ≈ **7¢**, ~285 s across 4 GPUs |
+| job | TUs | user cycles | segments |
+|---|---:|---:|---:|
+| job000 | 16 | 142.5 M | 176 |
+| job001 | 16 | 114.3 M | 141 |
+| job002 | 12 | 65.8 M | 81 |
+| link | 1 op | 1.8 M | 3 |
+| total | 44 | 324.4 M | 401 |
+
+**Measured on a rented 4090** ($0.40/hr, `prove-remote.sh --build`): the
+whole chain proved succinct in **740 s wall** (the 12 s + 1.55 s/segment
+model predicts 634 s of pure proving — the rest is per-job executor +
+serialization overhead). The four local groth16 wraps took 160–177 s
+each; end-to-end cold instance → verified groth16 chain ≈ 29 min wall.
+Exact billed cost (`vastai show invoices`): **$0.174** for the instance
+(GPU $0.167 + storage $0.007 — storage bills the requested 48 GB for the
+full lifetime, including the ~5 min image pull/boot). Parallelizing the
+3 compile jobs across instances (`--only`) would cut GPU wall to the
+largest job (~285 s) at the price of paying boot overhead per instance.
 
 Per-TU cost is dominated by the include closure (~7–9 M cycles ≈ 8–10
 segments per musl TU), not TU body size — batching amortizes only the
 1.2 M-cycle job startup. The link job is nearly free (3 segments).
-Journals are no longer 84 bytes: each commits its full manifest
-(~10–35 KB/job here); the 4-receipt attestation for musl-hello is ~98 KB.
+Journals are no longer 84 bytes: each commits its full manifest, so the
+groth16 receipts are journal-dominated (8.6–18.5 KB instead of 665 B);
+the 4-receipt embedded attestation is ~99 KB and verifies in ~17 ms.
 
 ## Other measured facts
 

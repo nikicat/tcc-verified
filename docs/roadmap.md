@@ -5,14 +5,12 @@ Roughly ordered; items are independent unless noted.
 Done 2026-06-11 (was the top of this list): **multi-file inputs** (in-guest
 memfs, journal v2 manifests), **multi-TU pipeline** (batched compile jobs +
 proven link, receipts chained by object hashes, `--only` fan-out), and
-**hello-world against real musl** (examples/musl-hello: 44 proven TUs,
-git-linked to musl.git by content). New IMAGE_ID — needs a re-pin bake.
+**hello-world against real musl, proven end-to-end on a rented 4090**
+(examples/musl-hello: 44 TUs, 740 s GPU, ~12¢, attestation embedded in the
+binary, 113/115 sources git-linked by content). IMAGE_ID re-pinned to
+`a2860a62` (local canonical-env bake ×2; CI bake must reproduce it).
 
 ## Near-term (each ~a day)
-
-- **Prove musl-hello on GPU end-to-end**: rebake the canonical image
-  (~400 segments ⇒ ~10 min single 4090, ~7¢; `prove-remote.sh --build` is
-  written but not yet exercised on a rental). Publish the attestation.
 - **Full musl libc.a**: all ~1262 TUs as a cached receipt set. Blocker: 37
   TUs fail TCC (x87 asm constraints `x`/`t`, `expl.s` syntax) — either
   upstream-style tcc patches, C fallbacks, or excluding the long-double
